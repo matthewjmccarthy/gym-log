@@ -69,9 +69,49 @@ svg{width:100%;height:auto;display:block}
 <script>
 /* ---------- storage ---------- */
 const KEY='upperBodyLog.v1';
-let S={workouts:[],body:[],draft:null};
+let S={workouts:[],body:[],draft:null,deleted:[]};
 try{const r=localStorage.getItem(KEY);if(r)S=Object.assign(S,JSON.parse(r));}catch(e){}
 function save(){try{localStorage.setItem(KEY,JSON.stringify(S));}catch(e){}}
+
+/* ---------- GitHub sync (history stored as a JSON text file in a repo) ---------- */
+let SYNC={repo:'',token:'',path:'history.json'},syncMsg='',syncing=false;
+try{const c=localStorage.getItem('upperBodyLog.sync');if(c)SYNC=Object.assign(SYNC,JSON.parse(c));}catch(e){}
+function saveSync(){try{localStorage.setItem('upperBodyLog.sync',JSON.stringify(SYNC));}catch(e){}}
+const b64e=s=>btoa(unescape(encodeURIComponent(s)));
+const b64d=s=>decodeURIComponent(escape(atob(s.replace(/\s/g,''))));
+const ghUrl=()=>'https://api.github.com/repos/'+SYNC.repo+'/contents/'+SYNC.path;
+const ghH=()=>({Authorization:'Bearer '+SYNC.token,Accept:'application/vnd.github+json'});
+function mergeIn(r){
+  const del=new Set([...(S.deleted||[]),...(r.deleted||[])].map(String));
+  S.deleted=[...del];
+  const mix=(a,b)=>{const m=new Map();[...(a||[]),...(b||[])].forEach(x=>{if(x&&!del.has(String(x.id)))m.set(String(x.id),x)});return [...m.values()]};
+  S.workouts=mix(S.workouts,r.workouts).sort((a,b)=>a.date<b.date?-1:a.date>b.date?1:a.id-b.id);
+  S.body=mix(S.body,r.body);
+}
+async function syncNow(){
+  if(!SYNC.repo||!SYNC.token||syncing)return;
+  syncing=true;syncMsg='Syncing…';
+  try{
+    for(let attempt=0;attempt<3;attempt++){
+      const res=await fetch(ghUrl(),{headers:ghH(),cache:'no-store'});
+      let sha;
+      if(res.status===200){const j=await res.json();sha=j.sha;
+        try{mergeIn(JSON.parse(b64d(j.content)))}catch(e){throw new Error('remote file is not valid JSON')}}
+      else if(res.status!==404)throw new Error('GitHub '+res.status+(res.status===401?' - check your token':''));
+      save();
+      const body={message:'Update workout log',content:b64e(JSON.stringify({workouts:S.workouts,body:S.body,deleted:S.deleted},null,1))};
+      if(sha)body.sha=sha;
+      const put=await fetch(ghUrl(),{method:'PUT',headers:Object.assign({'Content-Type':'application/json'},ghH()),body:JSON.stringify(body)});
+      if(put.ok){syncMsg='Synced '+new Date().toLocaleTimeString();break}
+      if((put.status===409||put.status===422)&&attempt<2)continue;
+      throw new Error('GitHub '+put.status+(put.status===404?' - check repo name and token access':put.status===403?' - token needs Contents: read & write':''));
+    }
+  }catch(e){syncMsg='Sync failed: '+e.message+'. Your data is safe on this device.'}
+  syncing=false;
+  const a=document.activeElement;
+  if(!a||!/INPUT|TEXTAREA|SELECT/.test(a.tagName))render();
+}
+window.addEventListener('online',()=>syncNow());
 
 /* ---------- programme ---------- */
 const PROG={
@@ -156,8 +196,16 @@ function exCard(ex,i){
     </div><button class="ghost" data-addset="${i}" style="margin-top:8px;width:100%">+ Add set</button></div>`;
 }
 
-function vHistory(){
-  if(!S.workouts.length)return `<h1>History</h1><div class="empty">No workouts saved yet.</div>`;
+function vHistory(){return histList()+syncCard()+backupCard();}
+function syncCard(){const on=SYNC.repo&&SYNC.token;
+  return `<div class="card"><h2>GitHub sync</h2><div class="sub" style="margin-bottom:8px">Saves your history to a text file (JSON) in a GitHub repo and shares it between your devices. Use a private repo.</div>
+  <label>Repo (owner/name)</label><input id="sy-repo" value="${esc(SYNC.repo)}" placeholder="yourname/gym-data" autocapitalize="off" autocorrect="off">
+  <label style="margin-top:8px">Access token</label><input id="sy-token" type="password" value="${esc(SYNC.token)}" placeholder="github_pat_...">
+  <label style="margin-top:8px">File path</label><input id="sy-path" value="${esc(SYNC.path)}" autocapitalize="off">
+  <div class="row" style="margin-top:10px"><button class="primary" data-syncsave>${on?'Save &amp; sync now':'Connect'}</button>${on?'<button class="danger" data-syncoff>Disconnect</button>':''}</div>
+  <div class="pill" style="margin-top:8px">${esc(syncMsg||(on?'Connected':'Not connected'))}</div></div>`;}
+function histList(){
+  if(!S.workouts.length)return `<h1>History</h1><div class="card"><div class="empty">No workouts saved yet.<br>Connect GitHub sync or import a backup below to bring your data in.</div></div>`;
   return `<h1>History</h1><div class="sub">${S.workouts.length} workouts logged</div><div class="card">`+
   S.workouts.slice().reverse().map(w=>{
     const vol=w.exercises.reduce((a,e)=>a+e.sets.reduce((b,s)=>b+(+s.w||0)*(+s.r||0),0),0);
@@ -165,8 +213,9 @@ function vHistory(){
       <div class="pill">Shoulder ${w.shoulder||'–'}/5 · volume ${Math.round(vol).toLocaleString()} kg</div></div>
       <button class="ghost danger" data-delw="${w.id}" style="flex:0 0 auto" aria-label="Delete workout">Delete</button></div>
       <div class="pill" style="margin-top:6px">${w.exercises.map(e=>{const ss=e.sets.filter(s=>+s.w>0||+s.r>0);return ss.length?esc(e.name)+': '+ss.map(s=>s.w+'×'+s.r).join(', '):''}).filter(Boolean).join('<br>')}</div>
-      ${w.notes?`<div class="pill" style="margin-top:6px;color:var(--text)">“${esc(w.notes)}”</div>`:''}</div>`}).join('')+`</div>
-  <div class="card"><h2>Backup</h2><div class="row"><button data-export>Download backup</button><button data-copy>Copy backup</button></div><div class="row" style="margin-top:8px"><button data-import>Import file</button><button data-paste>Import pasted</button></div>
+      ${w.notes?`<div class="pill" style="margin-top:6px;color:var(--text)">“${esc(w.notes)}”</div>`:''}</div>`}).join('')+`</div>`;
+}
+function backupCard(){return `<div class="card"><h2>Backup</h2><div class="row"><button data-export>Download backup</button><button data-copy>Copy backup</button></div><div class="row" style="margin-top:8px"><button data-import>Import file</button><button data-paste>Import pasted</button></div>
   <input type="file" id="impfile" accept="application/json" hidden></div>`;
 }
 
@@ -241,20 +290,22 @@ document.addEventListener('click',e=>{
     dr.exercises.forEach(x=>x.sets=x.sets.filter(s=>+s.w>0||+s.r>0));
     dr.exercises=dr.exercises.filter(x=>x.sets.length);
     if(!dr.exercises.length){alert('Enter at least one set first.');return}
-    S.workouts.push(dr);S.workouts.sort((a,b)=>a.date<b.date?-1:a.date>b.date?1:a.id-b.id);S.draft=null;save();tab='history';return flash('Workout saved')}
-  if(d.delw){if(confirm('Delete this workout?')){S.workouts=S.workouts.filter(w=>w.id!=d.delw);save();render()}return}
+    S.workouts.push(dr);S.workouts.sort((a,b)=>a.date<b.date?-1:a.date>b.date?1:a.id-b.id);S.draft=null;save();tab='history';syncNow();return flash('Workout saved')}
+  if(d.delw){if(confirm('Delete this workout?')){S.workouts=S.workouts.filter(w=>w.id!=d.delw);S.deleted.push(String(d.delw));save();render();syncNow()}return}
+  if(d.syncsave!==undefined){SYNC.repo=document.getElementById('sy-repo').value.trim().replace(/^https?:\/\/github\.com\//,'');SYNC.token=document.getElementById('sy-token').value.trim();SYNC.path=document.getElementById('sy-path').value.trim()||'history.json';saveSync();syncMsg='';render();syncNow();return}
+  if(d.syncoff!==undefined){if(confirm('Disconnect GitHub sync? Your data stays on this device.')){SYNC.token='';SYNC.repo='';saveSync();syncMsg='';render()}return}
   if(d.savebody!==undefined){
     const g=id=>document.getElementById(id).value;
     const r={id:Date.now(),date:g('b-date')||today(),bw:g('b-bw'),arm:g('b-arm'),chest:g('b-chest'),shoulder:g('b-shoulder')};
     if(!(+r.bw||+r.arm||+r.chest||+r.shoulder))return alert('Enter at least one value.');
-    S.body.push(r);save();return flash('Entry saved')}
-  if(d.delb){S.body=S.body.filter(b=>b.id!=d.delb);save();return render()}
+    S.body.push(r);save();syncNow();return flash('Entry saved')}
+  if(d.delb){S.body=S.body.filter(b=>b.id!=d.delb);S.deleted.push(String(d.delb));save();render();syncNow();return}
   if(d.export!==undefined){
     const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(S,null,1)],{type:'application/json'}));
     a.download='upper-body-log-'+today()+'.json';a.click();return}
   if(d.copy!==undefined){navigator.clipboard.writeText(JSON.stringify(S)).then(()=>flash('Backup copied'),()=>alert('Copy failed'));return}
   if(d.paste!==undefined){const t=prompt('Paste your backup text:');if(!t)return;
-    try{const j=JSON.parse(t);if(!Array.isArray(j.workouts))throw 0;if(confirm('Replace current data with this backup?')){S={workouts:j.workouts,body:j.body||[],draft:null};save();flash('Imported')}}catch(x){alert('Not a valid backup.')}return}
+    try{const j=JSON.parse(t);if(!Array.isArray(j.workouts))throw 0;if(confirm('Replace current data with this backup?')){S={workouts:j.workouts,body:j.body||[],draft:null,deleted:j.deleted||[]};save();flash('Imported');syncNow()}}catch(x){alert('Not a valid backup.')}return}
   if(d.import!==undefined){document.getElementById('impfile').click();return}
 });
 document.addEventListener('input',e=>{
@@ -269,11 +320,12 @@ document.addEventListener('change',e=>{
     const f=e.target.files[0];if(!f)return;
     const rd=new FileReader();rd.onload=()=>{try{const j=JSON.parse(rd.result);
       if(!Array.isArray(j.workouts))throw 0;
-      if(confirm('Replace current data with this backup?')){S={workouts:j.workouts,body:j.body||[],draft:null};save();flash('Imported')}}catch(x){alert('Not a valid backup file.')}};
+      if(confirm('Replace current data with this backup?')){S={workouts:j.workouts,body:j.body||[],draft:null,deleted:j.deleted||[]};save();flash('Imported');syncNow()}}catch(x){alert('Not a valid backup file.')}};
     rd.readAsText(f);
   }
 });
 render();
+syncNow();
 if('serviceWorker' in navigator&&location.protocol.startsWith('http')){navigator.serviceWorker.register('sw.js').catch(()=>{});}
 try{if(navigator.storage&&navigator.storage.persist)navigator.storage.persist();}catch(e){}
 </script>
